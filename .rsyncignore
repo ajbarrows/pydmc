@@ -1,0 +1,26 @@
+# Deliverables/reports
+reports/
+docs/presentations/
+*.pdf
+*.pptx
+
+# Data (often large/sensitive)
+data/raw/
+data/external/
+*.csv
+*.parquet
+*.h5
+
+# Compute artifacts
+.cache/
+logs/
+checkpoints/
+models/
+__pycache__/
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+conda-env/
+.git/

@@ -1,0 +1,16 @@
+[project]
+name = "pydmc"
+description = "Python implementation of DMC (Dynamic Models of Choice) R package, specifically for RDEX-ABCD model"
+version = "0.1.0"
+channels = ['conda-forge']
+platforms = ['linux-64', 'osx-64', 'osx-arm64', 'win-64']
+
+[dependencies]
+python = "~=3.10.0"
+ruff = "*"
+pip = "*"
+
+[pypi-dependencies]
+mkdocs = "*"
+python-dotenv = "*"
+pydmc = { path = ".", editable = true }
