@@ -3,12 +3,18 @@ pydmc: Python implementation of DMC (Dynamic Models of Choice).
 
 This package provides Python implementations of Dynamic Models of Choice,
 specifically for the RDEX-ABCD model, using hierarchical Bayesian estimation
-via Stan.
+via PyMC (much easier to use and debug than Stan!).
 
 Main Classes
 ------------
 WaldStopSignalModel : WALD Stop-Signal Model for response inhibition tasks
-StanBackend : Backend handler for Stan sampling interfaces
+
+Key Advantages of PyMC Version:
+- Pure Python (easier debugging)
+- Better error messages
+- No compilation step
+- Interactive development
+- Simpler to modify and extend
 
 Examples
 --------
@@ -18,26 +24,23 @@ Examples
 >>> # Load your data
 >>> data = pd.read_csv('stop_signal_data.csv')
 >>>
->>> # Create and fit hierarchical model
+>>> # Create and fit hierarchical model (PyMC!)
 >>> model = WaldStopSignalModel(use_hierarchical=True)
->>> fit = model.fit(data, chains=4, iter=2000)
+>>> trace = model.fit(data, draws=1000, tune=1000)
 >>>
->>> # Get parameter estimates
->>> estimates = model.get_parameter_estimates()
->>> print(estimates)
+>>> # Get summary
+>>> model.summary()
+>>>
+>>> # Plot results
+>>> model.plot_traces()
+>>> model.plot_posterior()
 """
 
-from .backends import StanBackend
 from .models import WaldStopSignalModel
-from .utils import setup_hpc_environment, check_environment, print_environment_info
 
-__version__ = "0.0.1"
+__version__ = "0.1.0-pymc"
 __author__ = "Tony Barrows"
 
 __all__ = [
     "WaldStopSignalModel",
-    "StanBackend",
-    "setup_hpc_environment",
-    "check_environment",
-    "print_environment_info",
 ]
