@@ -89,9 +89,20 @@ class WaldStopSignalModel:
     >>> model.posterior_predictive_check()
     """
 
-    def __init__(self, use_hierarchical: bool = True):
-        """Initialize the WALD Stop-Signal model."""
+    def __init__(self, use_hierarchical: bool = True, centered_parameterization: bool = False):
+        """
+        Initialize the WALD Stop-Signal model.
+
+        Parameters
+        ----------
+        use_hierarchical : bool, default=True
+            Whether to use hierarchical modeling
+        centered_parameterization : bool, default=False
+            For hierarchical models, use centered (True) vs non-centered (False) parameterization.
+            Centered is more stable with many subjects but slower.
+        """
         self.use_hierarchical = use_hierarchical
+        self.centered_parameterization = centered_parameterization
         self.backend = StanBackend()
         self.model_code = self._get_stan_code()
         self.compiled_model = None
@@ -102,7 +113,10 @@ class WaldStopSignalModel:
         """Generate Stan code for the WALD stop-signal model."""
 
         if self.use_hierarchical:
-            return self._get_hierarchical_stan_code()
+            if self.centered_parameterization:
+                return self._get_hierarchical_centered_stan_code()
+            else:
+                return self._get_hierarchical_stan_code()
         else:
             return self._get_individual_stan_code()
 
@@ -126,6 +140,29 @@ class WaldStopSignalModel:
                 return log(lambda_exg) - lambda_exg * (y - mu) +
                        lambda_exg^2 * sigma^2 / 2 +
                        normal_lcdf(z - lambda_exg * sigma | 0, 1);
+            }
+
+            // Wald random number generator using Michael-Schucany-Haas method
+            real wald_rng(real mu, real lambda) {
+                if (mu <= 0 || lambda <= 0) {
+                    reject("wald_rng: mu and lambda must be positive");
+                }
+                real nu = normal_rng(0, 1);
+                real y = nu * nu;
+                real x = mu + (mu * mu * y) / (2 * lambda) -
+                         (mu / (2 * lambda)) * sqrt(4 * mu * lambda * y + mu * mu * y * y);
+
+                // Ensure x is positive
+                if (x <= 0) {
+                    x = mu * mu * mu / (mu + mu * mu * y / (2 * lambda));
+                }
+
+                real u = uniform_rng(0, 1);
+                if (u <= mu / (mu + x)) {
+                    return fmax(x, 1e-10);
+                } else {
+                    return fmax((mu * mu) / x, 1e-10);
+                }
             }
         }
 
@@ -174,20 +211,20 @@ class WaldStopSignalModel:
         }
 
         model {
-            // Priors for hierarchical parameters
-            mu_params[1] ~ normal(log(1.0), 0.5);     // B (log scale)
-            mu_params[2] ~ normal(logit(0.15), 0.5);  // t0 (logit scale)
-            mu_params[3] ~ normal(logit(0.02), 1.0);  // gf (logit scale)
-            mu_params[4] ~ normal(log(0.5), 0.5);     // mu (log scale)
-            mu_params[5] ~ normal(log(0.05), 0.5);    // sigma (log scale)
-            mu_params[6] ~ normal(log(0.1), 0.5);     // tau (log scale)
-            mu_params[7] ~ normal(logit(0.05), 1.0);  // tf (logit scale)
-            mu_params[8] ~ normal(2.0, 0.5);          // vT (natural scale)
-            mu_params[9] ~ normal(1.0, 0.5);          // vF (natural scale)
-            mu_params[10] ~ normal(1.5, 0.5);         // v0 (natural scale)
-            mu_params[11] ~ normal(log(2.0), 0.5);    // k (log scale)
+            // Priors for hierarchical parameters (more conservative)
+            mu_params[1] ~ normal(log(1.0), 1.0);     // B (log scale)
+            mu_params[2] ~ normal(logit(0.15), 1.0);  // t0 (logit scale)
+            mu_params[3] ~ normal(logit(0.02), 1.5);  // gf (logit scale)
+            mu_params[4] ~ normal(log(0.5), 1.0);     // mu (log scale)
+            mu_params[5] ~ normal(log(0.05), 1.0);    // sigma (log scale)
+            mu_params[6] ~ normal(log(0.1), 1.0);     // tau (log scale)
+            mu_params[7] ~ normal(logit(0.05), 1.5);  // tf (logit scale)
+            mu_params[8] ~ normal(2.0, 1.0);          // vT (natural scale)
+            mu_params[9] ~ normal(1.0, 1.0);          // vF (natural scale)
+            mu_params[10] ~ normal(1.5, 1.0);         // v0 (natural scale)
+            mu_params[11] ~ normal(log(2.0), 1.0);    // k (log scale)
 
-            sigma_params ~ exponential(2);
+            sigma_params ~ normal(0, 0.5);  // More restrictive, half-normal via <lower=0>
 
             // Individual parameter deviations (standardized)
             for (s in 1:N_subjects) {
@@ -252,31 +289,249 @@ class WaldStopSignalModel:
                 real B = params[subj, 1];
                 real t0 = params[subj, 2];
                 real gf = params[subj, 3];
+                real tf = params[subj, 7];
                 real vT = params[subj, 8];
                 real vF = params[subj, 9];
 
                 if (is_stop_trial[i] == 0) {
                     // Go trial prediction
-                    if (bernoulli_rng(1 - gf)) {
+                    if (bernoulli_rng(1 - gf) == 1) {
                         real drift = correct[i] == 1 ? vT : vF;
-                        if (drift > 0) {
+                        if (drift > 0 && B > 0) {
                             real mu_wald = B / drift;
                             real lambda_wald = B^2;
-                            real scale_param = mu_wald / lambda_wald;
-                            rt_pred[i] = t0 + inv_gamma_rng(0.5, lambda_wald / (2 * scale_param));
-                            response_pred[i] = correct[i] == 1 ? stimulus[i] + 1 : 2 - stimulus[i];
+                            if (mu_wald > 0 && lambda_wald > 0) {
+                                rt_pred[i] = t0 + wald_rng(mu_wald, lambda_wald);
+                                response_pred[i] = correct[i] == 1 ? stimulus[i] + 1 : 2 - stimulus[i];
+                            } else {
+                                rt_pred[i] = -1;
+                                response_pred[i] = 0;
+                            }
                         } else {
-                            rt_pred[i] = t0 + 1.0;  // Default
+                            rt_pred[i] = -1;
                             response_pred[i] = 0;
                         }
                     } else {
-                        rt_pred[i] = -1;  // No response
+                        rt_pred[i] = -1;  // No response (go failure)
                         response_pred[i] = 0;
                     }
                 } else {
-                    // Stop trial prediction (simplified)
-                    rt_pred[i] = rt[i];  // Use observed for now
-                    response_pred[i] = response[i];
+                    // Stop trial prediction
+                    if (bernoulli_rng(1 - tf) == 1) {
+                        // Successfully stopped
+                        rt_pred[i] = -1;
+                        response_pred[i] = 0;
+                    } else {
+                        // Failed to stop - predict RT
+                        real drift = correct[i] == 1 ? vT : vF;
+                        if (drift > 0 && B > 0) {
+                            real mu_wald = B / drift;
+                            real lambda_wald = B^2;
+                            if (mu_wald > 0 && lambda_wald > 0) {
+                                rt_pred[i] = t0 + wald_rng(mu_wald, lambda_wald);
+                                response_pred[i] = correct[i] == 1 ? stimulus[i] + 1 : 2 - stimulus[i];
+                            } else {
+                                rt_pred[i] = -1;
+                                response_pred[i] = 0;
+                            }
+                        } else {
+                            rt_pred[i] = -1;
+                            response_pred[i] = 0;
+                        }
+                    }
+                }
+            }
+        }
+        """
+
+    def _get_hierarchical_centered_stan_code(self) -> str:
+        """Get Stan code for hierarchical model with centered parameterization (more stable)."""
+        return """
+        // Hierarchical WALD Stop-Signal Model (Centered Parameterization)
+        functions {
+            // WALD (Inverse Gaussian) log density
+            real wald_lpdf(real y, real mu, real lambda) {
+                if (y <= 0) return negative_infinity();
+                return 0.5 * (log(lambda) - log(2 * pi() * y^3)) -
+                       lambda * (y - mu)^2 / (2 * mu^2 * y);
+            }
+
+            // Wald random number generator
+            real wald_rng(real mu, real lambda) {
+                if (mu <= 0 || lambda <= 0) {
+                    reject("wald_rng: mu and lambda must be positive");
+                }
+                real nu = normal_rng(0, 1);
+                real y = nu * nu;
+                real x = mu + (mu * mu * y) / (2 * lambda) -
+                         (mu / (2 * lambda)) * sqrt(4 * mu * lambda * y + mu * mu * y * y);
+
+                if (x <= 0) {
+                    x = mu * mu * mu / (mu + mu * mu * y / (2 * lambda));
+                }
+
+                real u = uniform_rng(0, 1);
+                if (u <= mu / (mu + x)) {
+                    return fmax(x, 1e-10);
+                } else {
+                    return fmax((mu * mu) / x, 1e-10);
+                }
+            }
+        }
+
+        data {
+            int<lower=0> N;
+            int<lower=0> N_subjects;
+            int<lower=0> N_go;
+            int<lower=0> N_stop;
+
+            array[N] int<lower=1, upper=N_subjects> subject_id;
+            array[N] int<lower=0, upper=1> is_stop_trial;
+            array[N] int<lower=0, upper=2> response;
+            array[N] real<lower=0> rt;
+            array[N_stop] real<lower=0> ssd;
+            array[N] int<lower=0, upper=1> stimulus;
+            array[N] int<lower=0, upper=1> correct;
+        }
+
+        parameters {
+            // Group-level means (on natural scale for relevant parameters)
+            real<lower=0> mu_B;
+            real<lower=0, upper=0.5> mu_t0;  // Restrict to reasonable range
+            real<lower=0, upper=0.5> mu_gf;  // Failure rates should be low
+            real<lower=0, upper=0.5> mu_tf;
+            real mu_vT;
+            real mu_vF;
+
+            // Group-level SDs
+            real<lower=0> sigma_B;
+            real<lower=0> sigma_t0;
+            real<lower=0> sigma_gf;
+            real<lower=0> sigma_tf;
+            real<lower=0> sigma_vT;
+            real<lower=0> sigma_vF;
+
+            // Individual parameters (centered)
+            vector<lower=0>[N_subjects] B;
+            vector<lower=0, upper=0.5>[N_subjects] t0;  // Keep t0 reasonable
+            vector<lower=0, upper=0.5>[N_subjects] gf;
+            vector<lower=0, upper=0.5>[N_subjects] tf;
+            vector[N_subjects] vT;
+            vector[N_subjects] vF;
+        }
+
+        model {
+            // Priors on group means
+            mu_B ~ lognormal(0, 1);
+            mu_t0 ~ beta(3, 17);
+            mu_gf ~ beta(1, 19);
+            mu_tf ~ beta(1, 9);
+            mu_vT ~ normal(2, 1);
+            mu_vF ~ normal(1, 1);
+
+            // Priors on group SDs (half-normal)
+            sigma_B ~ normal(0, 0.5);
+            sigma_t0 ~ normal(0, 0.1);
+            sigma_gf ~ normal(0, 0.1);
+            sigma_tf ~ normal(0, 0.1);
+            sigma_vT ~ normal(0, 0.5);
+            sigma_vF ~ normal(0, 0.5);
+
+            // Individual parameters (centered)
+            B ~ lognormal(log(mu_B), sigma_B);
+            t0 ~ normal(mu_t0, sigma_t0);  // Truncated by bounds
+            gf ~ normal(mu_gf, sigma_gf);
+            tf ~ normal(mu_tf, sigma_tf);
+            vT ~ normal(mu_vT, sigma_vT);
+            vF ~ normal(mu_vF, sigma_vF);
+
+            // Likelihood
+            for (i in 1:N) {
+                int subj = subject_id[i];
+
+                if (is_stop_trial[i] == 0) {
+                    // Go trial
+                    if (response[i] > 0) {
+                        real drift = correct[i] == 1 ? vT[subj] : vF[subj];
+                        if (drift > 0) {
+                            real mu_wald = B[subj] / drift;
+                            real lambda_wald = B[subj]^2;
+                            target += wald_lpdf(rt[i] - t0[subj] | mu_wald, lambda_wald);
+                        } else {
+                            target += negative_infinity();
+                        }
+                    } else {
+                        target += log(gf[subj]);
+                    }
+                } else {
+                    // Stop trial
+                    if (response[i] == 0) {
+                        target += log(1 - tf[subj]);
+                    } else {
+                        real drift = correct[i] == 1 ? vT[subj] : vF[subj];
+                        if (drift > 0) {
+                            real mu_wald = B[subj] / drift;
+                            real lambda_wald = B[subj]^2;
+                            target += log(tf[subj]) + wald_lpdf(rt[i] - t0[subj] | mu_wald, lambda_wald);
+                        } else {
+                            target += log(tf[subj]) + negative_infinity();
+                        }
+                    }
+                }
+            }
+        }
+
+        generated quantities {
+            array[N] real rt_pred;
+            array[N] int response_pred;
+
+            for (i in 1:N) {
+                int subj = subject_id[i];
+
+                if (is_stop_trial[i] == 0) {
+                    // Go trial prediction
+                    if (bernoulli_rng(1 - gf[subj]) == 1) {
+                        real drift = correct[i] == 1 ? vT[subj] : vF[subj];
+                        if (drift > 0 && B[subj] > 0) {
+                            real mu_wald = B[subj] / drift;
+                            real lambda_wald = B[subj]^2;
+                            if (mu_wald > 0 && lambda_wald > 0) {
+                                rt_pred[i] = t0[subj] + wald_rng(mu_wald, lambda_wald);
+                                response_pred[i] = correct[i] == 1 ? stimulus[i] + 1 : 2 - stimulus[i];
+                            } else {
+                                rt_pred[i] = -1;
+                                response_pred[i] = 0;
+                            }
+                        } else {
+                            rt_pred[i] = -1;
+                            response_pred[i] = 0;
+                        }
+                    } else {
+                        rt_pred[i] = -1;
+                        response_pred[i] = 0;
+                    }
+                } else {
+                    // Stop trial prediction
+                    if (bernoulli_rng(1 - tf[subj]) == 1) {
+                        rt_pred[i] = -1;
+                        response_pred[i] = 0;
+                    } else {
+                        real drift = correct[i] == 1 ? vT[subj] : vF[subj];
+                        if (drift > 0 && B[subj] > 0) {
+                            real mu_wald = B[subj] / drift;
+                            real lambda_wald = B[subj]^2;
+                            if (mu_wald > 0 && lambda_wald > 0) {
+                                rt_pred[i] = t0[subj] + wald_rng(mu_wald, lambda_wald);
+                                response_pred[i] = correct[i] == 1 ? stimulus[i] + 1 : 2 - stimulus[i];
+                            } else {
+                                rt_pred[i] = -1;
+                                response_pred[i] = 0;
+                            }
+                        } else {
+                            rt_pred[i] = -1;
+                            response_pred[i] = 0;
+                        }
+                    }
                 }
             }
         }
@@ -291,6 +546,29 @@ class WaldStopSignalModel:
                 if (y <= 0) return negative_infinity();
                 return 0.5 * (log(lambda) - log(2 * pi() * y^3)) -
                        lambda * (y - mu)^2 / (2 * mu^2 * y);
+            }
+
+            // Wald random number generator using Michael-Schucany-Haas method
+            real wald_rng(real mu, real lambda) {
+                if (mu <= 0 || lambda <= 0) {
+                    reject("wald_rng: mu and lambda must be positive");
+                }
+                real nu = normal_rng(0, 1);
+                real y = nu * nu;
+                real x = mu + (mu * mu * y) / (2 * lambda) -
+                         (mu / (2 * lambda)) * sqrt(4 * mu * lambda * y + mu * mu * y * y);
+
+                // Ensure x is positive
+                if (x <= 0) {
+                    x = mu * mu * mu / (mu + mu * mu * y / (2 * lambda));
+                }
+
+                real u = uniform_rng(0, 1);
+                if (u <= mu / (mu + x)) {
+                    return fmax(x, 1e-10);
+                } else {
+                    return fmax((mu * mu) / x, 1e-10);
+                }
             }
         }
 
@@ -358,29 +636,156 @@ class WaldStopSignalModel:
 
             for (i in 1:N) {
                 if (is_stop_trial[i] == 0) {
-                    if (bernoulli_rng(1 - gf)) {
+                    // Go trial prediction
+                    if (bernoulli_rng(1 - gf) == 1) {
                         real drift = correct[i] == 1 ? vT : vF;
-                        if (drift > 0) {
+                        if (drift > 0 && B > 0) {
                             real mu_wald = B / drift;
                             real lambda_wald = B^2;
-                            real scale_param = mu_wald / lambda_wald;
-                            rt_pred[i] = t0 + inv_gamma_rng(0.5, lambda_wald / (2 * scale_param));
-                            response_pred[i] = correct[i] == 1 ? 1 : 2;
+                            if (mu_wald > 0 && lambda_wald > 0) {
+                                rt_pred[i] = t0 + wald_rng(mu_wald, lambda_wald);
+                                response_pred[i] = correct[i] == 1 ? 1 : 2;
+                            } else {
+                                rt_pred[i] = -1;
+                                response_pred[i] = 0;
+                            }
                         } else {
-                            rt_pred[i] = t0 + 1.0;
+                            rt_pred[i] = -1;
                             response_pred[i] = 0;
                         }
                     } else {
-                        rt_pred[i] = -1;
+                        rt_pred[i] = -1;  // No response (go failure)
                         response_pred[i] = 0;
                     }
                 } else {
-                    rt_pred[i] = rt[i];
-                    response_pred[i] = response[i];
+                    // Stop trial prediction
+                    if (bernoulli_rng(1 - tf) == 1) {
+                        // Successfully stopped
+                        rt_pred[i] = -1;
+                        response_pred[i] = 0;
+                    } else {
+                        // Failed to stop - predict RT
+                        real drift = correct[i] == 1 ? vT : vF;
+                        if (drift > 0 && B > 0) {
+                            real mu_wald = B / drift;
+                            real lambda_wald = B^2;
+                            if (mu_wald > 0 && lambda_wald > 0) {
+                                rt_pred[i] = t0 + wald_rng(mu_wald, lambda_wald);
+                                response_pred[i] = correct[i] == 1 ? 1 : 2;
+                            } else {
+                                rt_pred[i] = -1;
+                                response_pred[i] = 0;
+                            }
+                        } else {
+                            rt_pred[i] = -1;
+                            response_pred[i] = 0;
+                        }
+                    }
                 }
             }
         }
         """
+
+    def _check_and_setup_hpc_environment(self) -> None:
+        """
+        Check if running on HPC and setup temp directory if needed.
+
+        This method automatically detects permission issues with /tmp and
+        sets up a user-writable temporary directory.
+        """
+        import tempfile
+        import os
+
+        # Check if temp directory is writable
+        temp_dir = tempfile.gettempdir()
+        test_file = os.path.join(temp_dir, '.pydmc_test')
+
+        try:
+            with open(test_file, 'w') as f:
+                f.write('test')
+            os.remove(test_file)
+            # Temp directory is fine
+            return
+        except (OSError, PermissionError):
+            # Need to setup alternative temp directory
+            pass
+
+        # Detect HPC environment indicators
+        is_hpc = any([
+            os.path.exists('/gpfs'),
+            os.path.exists('/scratch'),
+            os.path.exists('/work'),
+            'SLURM_JOB_ID' in os.environ,
+            'PBS_JOBID' in os.environ,
+            'SGE_TASK_ID' in os.environ,
+        ])
+
+        if is_hpc or temp_dir == '/tmp':
+            print("Detected restricted temp directory. Setting up user temp directory...")
+            from .utils import setup_hpc_environment
+            setup_hpc_environment()
+            print("HPC environment configured successfully.\n")
+
+    def _validate_data(self, data_df: pd.DataFrame) -> None:
+        """
+        Validate data before fitting.
+
+        Parameters
+        ----------
+        data_df : pd.DataFrame
+            DataFrame to validate
+
+        Raises
+        ------
+        ValueError
+            If data has critical issues
+        """
+        # Check for extremely short or long RTs
+        valid_rt = data_df[data_df['rt'].notna()]['rt']
+        if len(valid_rt) > 0:
+            rt_min = valid_rt.min()
+            rt_max = valid_rt.max()
+
+            # Critical: RTs must be > 0.15s for model to work
+            # (non-decision time t0 is typically 0.1-0.3s)
+            if rt_min < 0.15:
+                raise ValueError(
+                    f"Minimum RT ({rt_min:.3f}s) is too short! "
+                    f"The model requires RT > 0.15s (to allow for non-decision time). "
+                    f"Filter your data: data = data[data['rt'] >= 0.15]"
+                )
+
+            if rt_min < 0.2:
+                print(f"Warning: Minimum RT is {rt_min:.3f}s. The model may struggle with RTs < 0.2s.")
+
+            if rt_max > 10.0:
+                print(f"Warning: Very long RTs detected (max: {rt_max:.3f}s). Consider filtering extreme values.")
+
+        # Check for sufficient data
+        n_trials = len(data_df)
+        n_subjects = data_df['subject'].nunique()
+
+        if n_trials < 50:
+            print(f"Warning: Only {n_trials} trials. Model may not converge well with sparse data.")
+
+        trials_per_subject = data_df.groupby('subject').size()
+        if trials_per_subject.min() < 30:
+            print(f"Warning: Some subjects have < 30 trials (min: {trials_per_subject.min()}). Consider excluding.")
+
+        # Check for response variability
+        response_counts = data_df['response'].value_counts()
+        if len(response_counts) < 2:
+            raise ValueError("Data must contain at least 2 different response types.")
+
+        # Check stimulus-response mapping
+        correct_rate = data_df[data_df['response'] > 0].apply(
+            lambda row: row['response'] == (row['stimulus'] + 1), axis=1
+        ).mean()
+
+        if correct_rate < 0.3:
+            print(f"Warning: Low correct response rate ({correct_rate:.1%}). Check stimulus-response coding.")
+        if correct_rate > 0.99:
+            print(f"Warning: Very high correct rate ({correct_rate:.1%}). Model may have convergence issues.")
 
     def prepare_data(self, data_df: pd.DataFrame) -> Dict:
         """
@@ -426,12 +831,22 @@ class WaldStopSignalModel:
             ((df['stimulus'] == 1) & (df['response'] == 2))
         ).astype(int)
 
-        # Remove trials with missing or invalid RT
-        valid_rt_mask = (df['rt'] > 0) & (df['rt'].notna())
+        # Remove trials with missing or invalid RT (only for trials with responses)
+        # For stop trials with no response, RT should be NaN
+        df_with_response = df[df['response'] > 0].copy()
+        df_no_response = df[df['response'] == 0].copy()
+
+        valid_rt_mask = (df_with_response['rt'] > 0) & (df_with_response['rt'].notna())
         if not valid_rt_mask.all():
             n_removed = (~valid_rt_mask).sum()
             print(f"Warning: Removed {n_removed} trials with invalid RT")
-            df = df[valid_rt_mask].copy()
+            df_with_response = df_with_response[valid_rt_mask].copy()
+
+        # For no-response trials, set RT to a placeholder (will not be used in likelihood)
+        if len(df_no_response) > 0:
+            df_no_response['rt'] = 0.5  # Placeholder value
+
+        df = pd.concat([df_with_response, df_no_response], ignore_index=True).sort_index()
 
         # Ensure response values are valid
         valid_response_mask = df['response'].isin([0, 1, 2])
@@ -454,16 +869,22 @@ class WaldStopSignalModel:
             if len(ssd_values) > 0:
                 ssd_values = df[df['is_stop_trial'] == 1]['ssd'].values
 
+            # Stan requires array with N_stop elements; use dummy if no stop trials
+            n_stop = int((df['is_stop_trial'] == 1).sum())
+            if n_stop == 0:
+                ssd_values = np.array([0.0])  # Dummy value (won't be used)
+                print("Warning: No stop trials in data. Using go trials only.")
+
             stan_data = {
                 'N': len(df),
                 'N_subjects': len(unique_subjects),
                 'N_go': int((df['is_stop_trial'] == 0).sum()),
-                'N_stop': int((df['is_stop_trial'] == 1).sum()),
+                'N_stop': max(n_stop, 1),  # At least 1 for Stan array declaration
                 'subject_id': df['subject_id'].values.astype(int),
                 'is_stop_trial': df['is_stop_trial'].values.astype(int),
                 'response': df['response'].values.astype(int),
                 'rt': df['rt'].values.astype(float),
-                'ssd': ssd_values.astype(float) if len(ssd_values) > 0 else np.array([]),
+                'ssd': ssd_values.astype(float),
                 'stimulus': df['stimulus'].values.astype(int),
                 'correct': df['correct'].values.astype(int)
             }
@@ -487,7 +908,7 @@ class WaldStopSignalModel:
 
     def fit(self, data_df: pd.DataFrame, chains: int = 4, iter: int = 2000,
             warmup: int = 1000, cores: Optional[int] = None,
-            show_progress: bool = True, **kwargs) -> Any:
+            show_progress: bool = True, auto_setup_hpc: bool = True, **kwargs) -> Any:
         """
         Fit the WALD stop-signal model using Stan.
 
@@ -505,6 +926,8 @@ class WaldStopSignalModel:
             Number of cores for parallel sampling (default: use all available)
         show_progress : bool, default=True
             Whether to show sampling progress
+        auto_setup_hpc : bool, default=True
+            Automatically detect and fix HPC temp directory issues
         **kwargs
             Additional arguments passed to Stan sampler
 
@@ -513,6 +936,13 @@ class WaldStopSignalModel:
         fit : StanFit
             Stan fit object with posterior samples
         """
+
+        # Auto-setup HPC environment if needed
+        if auto_setup_hpc:
+            self._check_and_setup_hpc_environment()
+
+        # Validate data first
+        self._validate_data(data_df)
 
         # Prepare data
         stan_data = self.prepare_data(data_df)

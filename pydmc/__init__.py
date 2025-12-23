@@ -29,6 +29,7 @@ Examples
 
 from .backends import StanBackend
 from .models import WaldStopSignalModel
+from .utils import setup_hpc_environment, check_environment, print_environment_info
 
 __version__ = "0.0.1"
 __author__ = "Tony Barrows"
@@ -36,4 +37,7 @@ __author__ = "Tony Barrows"
 __all__ = [
     "WaldStopSignalModel",
     "StanBackend",
+    "setup_hpc_environment",
+    "check_environment",
+    "print_environment_info",
 ]

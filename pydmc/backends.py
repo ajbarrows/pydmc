@@ -125,6 +125,10 @@ class StanBackend:
             - warmup : int, warmup iterations (default: 500)
             - cores : int, number of parallel cores (default: 4)
             - show_progress : bool, show sampling progress (default: True)
+            - show_console : bool, show Stan console output for debugging (CmdStanPy only)
+            - adapt_delta : float, target acceptance rate (default: 0.8)
+            - max_treedepth : int, maximum tree depth (default: 10)
+            - Additional backend-specific parameters are passed through
 
         Returns
         -------
@@ -139,13 +143,27 @@ class StanBackend:
 
         if self.backend_name == "cmdstanpy":
             # CmdStanPy interface
+            # Extract known parameters (don't modify original kwargs)
+            chains = kwargs.get('chains', 4)
+            iter_total = kwargs.get('iter', 1000)
+            warmup = kwargs.get('warmup', 500)
+            cores = kwargs.get('cores', 4)
+            show_progress = kwargs.get('show_progress', True)
+
+            # Build cmdstanpy-specific kwargs, excluding our custom ones
+            cmdstan_kwargs = {k: v for k, v in kwargs.items()
+                            if k not in ['chains', 'iter', 'warmup', 'cores', 'show_progress']}
+
+            # Pass through any additional CmdStanPy-specific parameters
+            # (like show_console, adapt_delta, max_treedepth, etc.)
             return model.sample(
                 data=data,
-                chains=kwargs.get('chains', 4),
-                iter_sampling=kwargs.get('iter', 1000) - kwargs.get('warmup', 500),
-                iter_warmup=kwargs.get('warmup', 500),
-                parallel_chains=kwargs.get('cores', 4),
-                show_progress=kwargs.get('show_progress', True)
+                chains=chains,
+                iter_sampling=iter_total - warmup,
+                iter_warmup=warmup,
+                parallel_chains=cores,
+                show_progress=show_progress,
+                **cmdstan_kwargs
             )
 
         elif self.backend_name == "pystan":
