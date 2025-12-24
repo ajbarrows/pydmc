@@ -46,8 +46,7 @@ Examples
 >>> model.plot_posterior()
 """
 
-from .models import WaldStopSignalModel
-from .rdex_abcd import RDEXABCDModel
+from .models import WaldStopSignalModel, RDEXABCDModel
 
 __version__ = "0.2.0-pymc-rdex-abcd"
 __author__ = "Tony Barrows"
