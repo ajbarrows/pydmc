@@ -40,12 +40,19 @@ class WaldStopSignalModel:
     >>> # Load data
     >>> data = pd.read_csv('stop_signal_data.csv')
     >>>
-    >>> # Create and fit model
+    >>> # Create model and check priors
     >>> model = WaldStopSignalModel(use_hierarchical=True)
+    >>> model.prepare_data(data)
+    >>> model.build_model()
+    >>> model.prior_predictive_check()  # Validate priors before fitting
+    >>>
+    >>> # Fit model
     >>> trace = model.fit(data, draws=1000, tune=1000)
     >>>
-    >>> # Get results
+    >>> # Get results and diagnostics
     >>> model.summary()
+    >>> model.plot_traces()
+    >>> model.posterior_predictive_check()  # Validate model fit
     """
 
     def __init__(self, use_hierarchical: bool = True):
@@ -190,8 +197,14 @@ class WaldStopSignalModel:
             # Decision time = RT - non-decision time
             dt = self.data['rt'] - t0_trial
 
-            # Wald likelihood (cleaner than Stan!)
-            pm.Wald('obs', mu=mu_wald, lam=lambda_wald, observed=dt)
+            # Wald log-likelihood (using pm.Potential for custom likelihood)
+            # The Wald distribution log-pdf is:
+            # log_wald(x; mu, lambda) = 0.5*log(lambda/(2*pi*x^3)) - lambda*(x-mu)^2/(2*mu^2*x)
+            log_wald = (
+                0.5 * pm.math.log(lambda_wald / (2 * np.pi * dt**3))
+                - lambda_wald * (dt - mu_wald)**2 / (2 * mu_wald**2 * dt)
+            )
+            pm.Potential('obs', log_wald)
 
         self.model = model
         return model
@@ -339,21 +352,114 @@ class WaldStopSignalModel:
         print(f"Results loaded from: {filepath}")
         return self.trace
 
-    def posterior_predictive_check(self, **kwargs):
+    def prior_predictive_check(self, samples: int = 500, **kwargs):
         """
-        Perform posterior predictive checks.
+        Perform prior predictive checks to validate prior choices.
+
+        This samples from the prior distributions and generates predictions
+        to check if the priors produce reasonable values before seeing data.
 
         Parameters
         ----------
+        samples : int, default=500
+            Number of prior samples to draw
         **kwargs
-            Additional arguments for az.plot_ppc()
+            Additional arguments for pm.sample_prior_predictive()
+
+        Returns
+        -------
+        arviz.InferenceData
+            Prior predictive samples
+        """
+        if self.model is None:
+            raise ValueError("Model has not been built yet. Call prepare_data() and build_model() first.")
+
+        print(f"Sampling {samples} prior predictive samples...")
+        with self.model:
+            prior_pred = pm.sample_prior_predictive(samples=samples, **kwargs)
+
+        # Plot prior predictive distributions
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+        # Plot prior distributions for key parameters
+        if self.use_hierarchical:
+            param_names = ['mu_B', 'mu_t0', 'mu_v_true', 'mu_v_false']
+            titles = ['Prior: Boundary (B)', 'Prior: Non-decision time (t0)',
+                     'Prior: Drift rate (correct)', 'Prior: Drift rate (error)']
+        else:
+            param_names = ['B', 't0', 'v_true', 'v_false']
+            titles = ['Prior: Boundary (B)', 'Prior: Non-decision time (t0)',
+                     'Prior: Drift rate (correct)', 'Prior: Drift rate (error)']
+
+        for ax, param, title in zip(axes.flat, param_names, titles):
+            if param in prior_pred.prior:
+                samples_flat = prior_pred.prior[param].values.flatten()
+                ax.hist(samples_flat, bins=50, alpha=0.7, edgecolor='black')
+                ax.set_title(title)
+                ax.set_xlabel('Value')
+                ax.set_ylabel('Frequency')
+                ax.axvline(samples_flat.mean(), color='red', linestyle='--',
+                          label=f'Mean: {samples_flat.mean():.3f}')
+                ax.legend()
+
+        plt.tight_layout()
+        plt.show()
+
+        # Also plot the prior predictive for observed data if available
+        if 'obs' in prior_pred.prior_predictive:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            obs_samples = prior_pred.prior_predictive['obs'].values.flatten()
+            # Only plot reasonable RT values
+            obs_samples = obs_samples[(obs_samples > 0) & (obs_samples < 5)]
+            ax.hist(obs_samples, bins=100, alpha=0.7, edgecolor='black')
+            ax.set_title('Prior Predictive: Decision Time Distribution')
+            ax.set_xlabel('Decision Time (s)')
+            ax.set_ylabel('Frequency')
+            ax.axvline(obs_samples.mean(), color='red', linestyle='--',
+                      label=f'Mean: {obs_samples.mean():.3f}s')
+            if self.data is not None:
+                actual_dt = self.data['rt'] - 0.15  # Approximate
+                ax.axvline(actual_dt.mean(), color='green', linestyle='--',
+                          label=f'Actual mean: {actual_dt.mean():.3f}s', linewidth=2)
+            ax.legend()
+            plt.tight_layout()
+            plt.show()
+
+        print("✓ Prior predictive check complete!")
+        return prior_pred
+
+    def posterior_predictive_check(self, samples: Optional[int] = None, **kwargs):
+        """
+        Perform posterior predictive checks.
+
+        This generates predictions from the fitted posterior to check
+        if the model can reproduce the observed data patterns.
+
+        Parameters
+        ----------
+        samples : int, optional
+            Number of posterior predictive samples. If None, uses all posterior samples.
+        **kwargs
+            Additional arguments for pm.sample_posterior_predictive()
+
+        Returns
+        -------
+        arviz.InferenceData
+            Posterior predictive samples
         """
         if self.trace is None:
-            print("Model has not been fitted yet.")
-            return
+            raise ValueError("Model has not been fitted yet. Call fit() first.")
 
+        print("Generating posterior predictive samples...")
         with self.model:
+            if samples is not None:
+                kwargs['predictions'] = samples
             ppc = pm.sample_posterior_predictive(self.trace, **kwargs)
 
-        az.plot_ppc(az.from_pymc3(posterior_predictive=ppc, model=self.model))
+        # Plot posterior predictive check
+        az.plot_ppc(ppc, num_pp_samples=100)
+        plt.tight_layout()
         plt.show()
+
+        print("✓ Posterior predictive check complete!")
+        return ppc
